@@ -715,3 +715,95 @@ class FBNet_SE(object):
       self.get_theta(save_path="./theta-result/%sepoch_%d_theta.txt" %
                                  (result_prefix, epoch))
       self._temperature_val *= temperature_annel
+  
+  def _Sample(self,theat_filepath,train_iter,val_iter):
+    self._logger.info("Sample symbol")
+    data = self._data
+
+    data = mx.sym.Convolution(data=data, num_filter=self._f[0], kernel=(3, 3), stride=(1, 1), pad=(1, 1),no_bias=True, name="conv0")
+    data = mx.sym.BatchNorm(data=data, fix_gamma=False, eps=2e-5, momentum=0.9, name= 'bn0')
+    data = mx.sym.Activation(data=data, act_type='relu', name='relu0')
+    data = mx.symbol.Pooling(data=data, kernel=(3, 3), stride=(2, 2), pad=(1, 1), pool_type='max', name='pool0', 
+                                 pooling_convention='full')
+    f_index = 0
+    for b_index in range(self._unistage):
+
+      num_layers = self._n[b_index]
+      num_filter = self._f[b_index+ 1]
+
+      for l_index in range(num_layers):
+
+        if b_index != 0 and  l_index ==0:
+          stride =2
+        else:
+          stride =1
+        dim_match = False if l_index == 0 else True
+
+        with open(theat_filepath) as f:
+          theta_result = f.readlines()
+        i_index = np.argmax(theta_result[f_index].strip().split(' ')[1:])
+
+        type = 'bottle_neck' if i_index<=1 else 'resnet'
+        prefix = "layer_%s_%d_%d_block_0" % (type,b_index, l_index)
+        group = self._group[i_index]
+        kernel_size = self._kernel[i_index]
+        se = self._se[i_index]
+        if i_index<=4:
+          data = block_factory_se(input_symbol = data,name= prefix,num_filter=num_filter,group=group,stride=stride,
+                                       se= se,k_size=  kernel_size,type = type,dim_match= dim_match)
+        # TODO  deformable_Conv part
+        else:
+          data = block_factory_se(input_symbol=data, name=prefix, num_filter=num_filter, group=1,
+                                       stride=2,se=1, k_size=3, type='deform_conv')
+         
+        f_index+=1
+
+        if b_index>=3 and l_index>=1: 
+          pass
+
+    data = mx.symbol.Pooling(data=data, global_pool=True,
+                             kernel=(7, 7), pool_type='avg', name="global_pool")
+    data = mx.symbol.Flatten(data=data, name='flat_pool')
+    data = mx.symbol.FullyConnected(data=data, num_hidden=self._feature_dim)
+    # fc part
+    if self._model_type == 'softmax':
+      data = mx.symbol.FullyConnected(name="output_fc",
+                                      data=data, num_hidden=self._output_dim)
+    elif self._model_type == 'amsoftmax':
+      s = 30.0
+      margin = 0.3
+      data = mx.symbol.L2Normalization(data, mode='instance', eps=1e-8) * s
+      w = mx.sym.Variable('fc_weight', init=mx.init.Xavier(magnitude=2),
+                          shape=(self._output_dim, self._feature_dim), dtype=np.float32)
+      norm_w = mx.symbol.L2Normalization(w, mode='instance', eps=1e-8)
+      data = mx.symbol.AmSoftmax(data, weight=norm_w, num_hidden=self._output_dim,
+                                 lower_class_idx=0, upper_class_idx=self._output_dim,
+                                 verbose=False, margin=margin, s=s,
+                                 label=self._label_index)
+    elif self._model_type == 'arcface':
+      s = 64.0
+      margin = 0.5
+      data = mx.symbol.L2Normalization(data, mode='instance', eps=1e-8) * s
+      w = mx.sym.Variable('fc_weight', init=mx.init.Xavier(magnitude=2),
+                          shape=(self._output_dim, self._feature_dim), dtype=np.float32)
+      norm_w = mx.symbol.L2Normalization(w, mode='instance', eps=1e-8)
+      data = mx.symbol.Arcface(data, weight=norm_w, num_hidden=self._output_dim,
+                               lower_class_idx=0, upper_class_idx=self._output_dim,
+                               verbose=False, margin=margin, s=s,
+                               label=self._label_index)
+    self._output = data
+
+    self._fbnet_model = mx.mod.Module(symbol=self._output, context=mx.cpu())
+
+    self._fbnet_model.fit(train_iter, eval_data=val_iter,   
+                optimizer='sgd', 
+                optimizer_params={'learning_rate': 0.08,
+                                    'wd':0.0005},  
+                eval_metric='acc',  
+                batch_end_callback=mx.callback.Speedometer(100, 100),
+                num_epoch=10)  
+    
+    # Using Test_Iter test acc 
+    acc = mx.metric.Accuracy()
+    self._fbnet_model .score(val_iter, acc)
+    print(acc)

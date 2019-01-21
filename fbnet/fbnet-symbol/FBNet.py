@@ -738,3 +738,106 @@ class FBNet(object):
       self.get_theta(save_path="./theta-result/%sepoch_%d_theta.txt" %
                                  (result_prefix, epoch))
       self._temperature_val *= temperature_annel
+
+  def _Sample(self,train_iter,val_iter,theat_filepath):
+    self._logger.info("Sample symbol")
+    data = self._data
+    f_index = 0
+    for outer_layer_idx in range(len(self._f)):
+      num_filter = self._f[outer_layer_idx]
+      num_layers = self._n[outer_layer_idx]
+      s_size = self._s[outer_layer_idx]
+
+      if outer_layer_idx == 0:
+        data = mx.sym.Convolution(data=data, num_filter=num_filter,
+                  kernel=(3, 3), stride=(s_size, s_size), pad=(1, 1))
+        # data = mx.sym.BatchNorm(data=data, fix_gamma=False, eps=2e-5, momentum=0.9)
+        data = mx.sym.Activation(data=data, act_type='relu')
+        input_channels = num_filter
+      elif (outer_layer_idx <= self._tbs[1]) and (outer_layer_idx >= self._tbs[0]):
+
+        for inner_layer_idx in range(num_layers):
+          data = mx.sym.BatchNorm(data=data, fix_gamma=False, eps=2e-5, momentum=0.9)
+          if inner_layer_idx == 0:
+            s_size = s_size
+          else:
+            s_size = 1
+
+          with open(theat_filepath) as f:
+            theta_result = f.readlines()
+          block_idx = np.argmax(theta_result[f_index].strip().split(' ')[1:])
+
+          if block_idx<= 7:
+            kernel_size = (self._kernel[block_idx], self._kernel[block_idx])
+            group = self._group[block_idx]
+            prefix = "layer_%d_%d_block_%d" % (outer_layer_idx, inner_layer_idx, block_idx)
+            expansion = self._e[block_idx]
+            stride = (s_size, s_size)
+            data = block_factory(data, input_channels=input_channels,
+                                  num_filters=num_filter, kernel_size=kernel_size,
+                                  prefix=prefix, expansion=expansion,
+                                  group=group, shuffle=True,
+                                  stride=stride, bn=False)
+          else: # skip layer
+            data = data
+          input_channels = num_filter
+          f_index+=1
+
+      elif outer_layer_idx == len(self._f) - 1:
+        # last 1x1 conv part
+        data = mx.sym.BatchNorm(data=data, fix_gamma=False, eps=2e-5, momentum=0.9)
+        data = mx.sym.Activation(data=data, act_type='relu')
+        data = mx.sym.Convolution(data, num_filter=num_filter,
+                                  stride=(s_size, s_size),
+                                  kernel=(3, 3),
+                                  name="layer_%d_last_conv" % outer_layer_idx)
+      else:
+        raise ValueError("Wrong layer index %d" % outer_layer_idx)
+    
+    # avg pool part
+    data = mx.symbol.Pooling(data=data, global_pool=True, 
+        kernel=(7, 7), pool_type='avg', name="global_pool")
+  
+    data = mx.symbol.Flatten(data=data, name='flat_pool')
+    data = mx.symbol.FullyConnected(data=data, num_hidden=self._feature_dim)
+    # fc part
+    if self._model_type == 'softmax':
+      data = mx.symbol.FullyConnected(name="output_fc", 
+          data=data, num_hidden=self._output_dim)
+    elif self._model_type == 'amsoftmax':
+      s = 30.0
+      margin = 0.3
+      data = mx.symbol.L2Normalization(data, mode='instance', eps=1e-8) * s
+      w = mx.sym.Variable('fc_weight', init=mx.init.Xavier(magnitude=2),
+                        shape=(self._output_dim, self._feature_dim), dtype=np.float32)
+      norm_w = mx.symbol.L2Normalization(w, mode='instance', eps=1e-8)
+      data = mx.symbol.AmSoftmax(data, weight=norm_w, num_hidden=self._output_dim,
+                                lower_class_idx=0, upper_class_idx=self._output_dim,
+                                verbose=False, margin=margin, s=s,
+                                label=self._label_index)
+    elif self._model_type == 'arcface':
+      s = 64.0
+      margin = 0.5
+      data = mx.symbol.L2Normalization(data, mode='instance', eps=1e-8) * s
+      w = mx.sym.Variable('fc_weight', init=mx.init.Xavier(magnitude=2),
+                        shape=(self._output_dim, self._feature_dim), dtype=np.float32)
+      norm_w = mx.symbol.L2Normalization(w, mode='instance', eps=1e-8)
+      data = mx.symbol.Arcface(data, weight=norm_w, num_hidden=self._output_dim,
+                                lower_class_idx=0, upper_class_idx=self._output_dim,
+                                verbose=False, margin=margin, s=s,
+                                label=self._label_index)
+    self._output = data
+    self._fbnet_model = mx.mod.Module(symbol=self._output, context=mx.cpu())
+    self._fbnet_model.fit(train_iter, eval_data=val_iter,   
+                optimizer='sgd', 
+                optimizer_params={'learning_rate': 0.08,
+                                    'wd':0.0005},  
+                eval_metric='acc',  
+                batch_end_callback=mx.callback.Speedometer(100, 100),
+                num_epoch=10)  
+    
+    # Using Test_Iter test acc 
+    acc = mx.metric.Accuracy()
+    self._fbnet_model .score(val_iter, acc)
+    print(acc)
+
