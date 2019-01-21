@@ -344,7 +344,7 @@ class FBNet(object):
     self._loss = mx.sym.Group([self._loss, mx.sym.BlockGrad(self._softmax_output)])
     return self._loss
   
-  def bind_exe(self, **input_shape):
+  def bind_exe(self,arg_params= None, aux_params= None, **input_shape):
     """Bind symbol to get an executor.
     """
     self._logger.info("Bind executor")
@@ -381,7 +381,7 @@ class FBNet(object):
       self._grad_dict.append(exe.grad_dict)
       self._aux_dict.append(exe.aux_dict)
 
-      if self._load_model_path is None:
+      if arg_params == None:
         # initilize parameters
         # default value for $\theta$ is 1
         for name, arr in self._arg_dict[i].items():
@@ -394,10 +394,7 @@ class FBNet(object):
               init_dict[name] = arr.as_in_context(mx.cpu())
           elif self._theta_unique_name in name:
             arr[:] = self._theta_init_value
-        self._logger.info("Success init_params for biuild exe")
       else:
-
-        arg_params, aux_params, start_epoch = self.load_model()
 
         for name, arr in self._arg_dict[i].items():
           if name not in self._input_shapes:
@@ -406,7 +403,8 @@ class FBNet(object):
         for name, arr in self._aux_dict[i].items():
           if name not in self._input_shapes:
             self._aux_dict[i][name][:] = aux_params[name]
-        #self._logger.info("Success load_model for biuild exe")
+
+        self._logger.info("Success load_model for biuild exe")
 
     self._no_update_params_name = set((self._data_name, self._label_name,
             "temperature"))
@@ -598,8 +596,6 @@ class FBNet(object):
 
           save_dict = {('arg:%s' % k): v for k, v in self._exe[0].arg_dict.items()}
           save_dict.update({('aux:%s' % k): v for k, v in self._exe[0].aux_dict.items()})
-
-          # tempe = mx.nd.array([self._temperature])
           # save_dict.update({'temperature:': tempe})
           # res = []
           # name = []
@@ -607,8 +603,8 @@ class FBNet(object):
           #  nd = self._arg_dict[t]
           #  res.append(nd)
           #  name.append(t)
-
-          # save_dict.update({('theta:%s' % k): v for k, v in zip(name,res)})
+          tempe = mx.nd.array([self._temperature_val])
+          save_dict.update({'temperature:':tempe})
 
           param_name = os.path.join(self._save_model_path, 'checkpoint_{}_{}_{}.params').format(self._model_type, epoch, nbatch)
 
@@ -669,31 +665,33 @@ class FBNet(object):
 
   def load_model(self):
     if self._load_model_path is not None:
-
       if '.params' in self._load_model_path:
         load_param_dict = mx.nd.load(self._load_model_path)
         model_file = self._load_model_path
-        epoch = self._load_model_path.split('_')[-2]
+        epoch = int(self._load_model_path.split('_')[-2])
       else:
         model_list = glob.glob(self._load_model_path+'/*.params')
-        model_list.sort()
+        model_list.sort(key = lambda d:int(d.split('_')[-2]))
         model_file = model_list[-1]
-        epoch = model_list[-1].split('_')[-2]
+        epoch = int(model_file.split('_')[-2])
         load_param_dict = mx.nd.load(model_list[-1])
 
       self._logger.info("load_model: %s  epoch[%s]"%(model_file,epoch))
       arg_params = {}
       aux_params = {}
+      # TODO if no temperature had be saved, init it with 5.0
+      load_temperature = mx.nd.array([5.0])
       for k,v in load_param_dict.items():
         arg_type, name = k.split(':', 1)
         if arg_type == 'arg':
           arg_params[name] = v
         elif arg_type == 'aux':
             aux_params[name] = v
+        elif arg_type == 'temperature':
+            load_temperature = v
         else:
-          self._logger.info("Not found param_type %s" %k)
-
-    return arg_params,aux_params,epoch
+          logging.info("Not found param_type %s" %k)
+    return arg_params,aux_params,load_temperature,epoch
 
   def search(self, 
              w_s_ds,
@@ -709,30 +707,34 @@ class FBNet(object):
     """
     if len(result_prefix) > 0:
       result_prefix += '_'
+
     self._build()
     self.define_loss()
-
-    start_epoch = self.bind_exe()
-    start_epoch = int(start_epoch)
-
-    logging.info("start_epoch %d" % start_epoch)
-
+    start_epoch = 0
+    if self._load_model_path != None:
+      arg_params,aux_params,load_temperature,start_epoch = self.load_model()
+      self._temperature_val = float(load_temperature.asnumpy())
+      self.bind_exe(arg_params,aux_params)
+    else:
+      self.bind_exe()
+      self._temperature_val = init_temperature
+    
     self.init_optimizer(lr_decay_step=lr_decay_step,
                         cosine_decay_step=cosine_decay_step)
 
-    w_epochs = int(start_epoch - start_w_epochs - 1)
-    if w_epochs <= 0:
-      self.train_w_a(w_s_ds, epochs = int(start_w_epochs - start_epoch -1),
-                     start_epoch=start_epoch, temperature=init_temperature)
-     
-    start_epoch = max(w_epochs,0)
-    temperature = init_temperature * pow(temperature_annel, start_epoch)
+    w_epochs = int(start_w_epochs - start_epoch)
+    self._logger.info("start_epoch %d wa_epochs %d temperature_val %f " % (start_epoch,w_epochs,self._temperature_val))
     
-    for epoch in range(start_epoch, epochs - start_w_epochs):
+    if w_epochs > 0:
+      self.train_w_a(w_s_ds, epochs = w_epochs,
+                     start_epoch=start_epoch, temperature=self._temperature_val)             
+
+    start_epoch = max(start_w_epochs,start_epoch)
+    for epoch in range(start_epoch, epochs):
       self.train_w_a(w_s_ds, epochs=1, start_epoch=epoch,
-                       temperature=temperature)
+                       temperature=self._temperature_val)
       self.train_theta(theta_ds, epochs=1, start_epoch=epoch,
-                         temperature=temperature)
+                         temperature=self._temperature_val)
       self.get_theta(save_path="./theta-result/%sepoch_%d_theta.txt" %
                                  (result_prefix, epoch))
-      temperature *= temperature_annel
+      self._temperature_val *= temperature_annel
